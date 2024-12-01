@@ -14,7 +14,7 @@ module Resque
       end
 
       # Method to set rate limits on a specific queue
-      def rate_limit(queue, options={})
+      def rate_limit(queue, options = {})
         if options.keys.sort != [:at, :per]
           raise ArgumentError.new("Missing either :at or :per in options")
         end
@@ -32,33 +32,26 @@ module Resque
         !!@rate_limits[queue.to_s]
       end
 
+      def rate_limiting_queue_lock_key(queue)
+        "#{LOCK_KEYS_PREFIX}:lock:#{queue}"
+      end
+
+      def rate_limit_key_for(queue)
+        "#{LOCK_KEYS_PREFIX}:rate_limit:#{queue}"
+      end
+
+      def processed_job_count_in_rate_limit_window(queue)
+        Resque.redis.get(rate_limit_key_for(queue)).to_i
+      end
+
       # Check if a queue has exceeded its rate limit
       def queue_at_or_over_rate_limit?(queue)
         if queue_rate_limited?(queue)
-          Resque.redis.get("rate_limit:#{queue}").to_i >= rate_limit_for(queue)[:at]
+          processed_job_count_in_rate_limit_window(queue) >= rate_limit_for(queue)[:at]
         else
           false
         end
       end
-
-      # Garbage collection for expired rate-limit data
-      def gc_rate_limit_data_for_queue(queue)
-        return unless queue_rate_limited?(queue)
-
-        limit = rate_limit_for(queue)
-        queue_key = "#{LOCK_KEYS_PREFIX}:#{queue}_uuids"
-        uuids = Resque.redis.smembers(queue_key)
-
-        uuids.each do |uuid|
-          job_ended_at = Resque.redis.hmget("#{LOCK_KEYS_PREFIX}:jobs:#{uuid}", "ended_at")[0]
-          if job_ended_at && Time.at(job_ended_at.to_i) < Time.now - limit[:per]
-            Resque.redis.srem(queue_key, uuid)
-            Resque.redis.del("#{LOCK_KEYS_PREFIX}:jobs:#{uuid}")
-          end
-        end
-      end
-
-      private
     end
   end
 end
@@ -79,21 +72,20 @@ module Resque
           log_with_severity :debug, "Rate limit applies to #{queue}, attempting to acquire lock"
 
           # Step 2: Try to acquire a Redis lock for this queue.
-          lock_key = "#{Resque::Plugins::Throttler::LOCK_KEYS_PREFIX}:lock:#{queue}"
-          lock_acquired = acquire_lock(lock_key)
+          lock_acquired = acquire_lock(queue)
 
           unless lock_acquired
             log_with_severity :debug, "Could not acquire lock for #{queue}, skipping"
             next
           end
+
           log_with_severity :debug, "lock acquired"
 
           # Step 3: Check if rate limit is exceeded for this queue.
-          rate_limit_key = "rate_limit:#{queue}"
           if Resque.queue_at_or_over_rate_limit?(queue)
             log_with_severity :debug, "#{queue} is over its rate limit, releasing lock and skipping"
-            release_lock(lock_key)
-            log_with_severity :error, "lock released"
+            release_lock(queue)
+            log_with_severity :debug, "lock released"
             next
           end
           log_with_severity :debug, "#{queue} is not over its rate limit, proceeding"
@@ -101,14 +93,15 @@ module Resque
           # Step 4: Reserve a job from the queue.
           if job = Resque.reserve(queue)
             log_with_severity :debug, "Found job on #{queue}"
-            increment_job_counter(rate_limit_key, queue)
+            increment_job_counter(queue)
 
-            release_lock(lock_key)
-            log_with_severity :error, "lock released"
+            release_lock(queue)
+            log_with_severity :debug, "lock released"
             return job
           else
-            release_lock(lock_key)
-            log_with_severity :error, "lock released"
+            log_with_severity :debug, "No job on #{queue}"
+            release_lock(queue)
+            log_with_severity :debug, "lock released, continuing checking other queues"
           end
         else
           log_with_severity :debug, "Checking #{queue}"
@@ -129,20 +122,20 @@ module Resque
     private
 
     # Helper method to acquire a Redis lock
-    def acquire_lock(lock_key)
-      Resque.redis.set(lock_key, "locked", ex: 30, nx: true)  # NX means "set if not exists"
+    def acquire_lock(queue)
+      Resque.redis.set(Resque.rate_limiting_queue_lock_key(queue), "locked", ex: 30, nx: true) # NX means "set if not exists"
     end
 
     # Helper method to release the Redis lock
-    def release_lock(lock_key)
-      Resque.redis.del(lock_key)
+    def release_lock(queue)
+      Resque.redis.del(Resque.rate_limiting_queue_lock_key(queue))
     end
 
     # Helper method to increment the job counter for rate-limiting
-    def increment_job_counter(rate_limit_key, queue)
-      Resque.redis.incr(rate_limit_key)
+    def increment_job_counter(queue)
+      Resque.redis.incr(Resque.rate_limit_key_for(queue))
       limit = Resque.rate_limit_for(queue)
-      Resque.redis.expire(rate_limit_key, limit[:per])
+      Resque.redis.expire(Resque.rate_limit_key_for(queue), limit[:per])
     end
   end
 end
