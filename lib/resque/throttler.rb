@@ -27,6 +27,10 @@ module Resque
         @rate_limits[queue.to_s]
       end
 
+      def rate_limited_queues
+        @rate_limits.keys
+      end
+
       # Check if a queue has a rate limit configured
       def queue_rate_limited?(queue)
         !!@rate_limits[queue.to_s]
@@ -51,6 +55,25 @@ module Resque
         else
           false
         end
+      end
+
+      def reset_throttling(queue = nil)
+        if queue
+          reset_queue_throttling(queue)
+        else
+          rate_limited_queues.each do |queue_name|
+            reset_queue_throttling(queue_name)
+          end
+        end
+      end
+
+      private
+
+      def reset_queue_throttling(queue)
+        lock_key = rate_limiting_queue_lock_key(queue)
+        rate_limit_key = rate_limit_key_for(queue)
+        Resque.redis.del(lock_key)
+        Resque.redis.del(rate_limit_key)
       end
     end
   end
