@@ -3,52 +3,90 @@ require 'securerandom'
 
 module Resque
   module Plugins
+    # The Throttler module provides rate-limiting capabilities for Resque queues.
     module Throttler
       extend self
 
+      # Prefix used for Redis keys related to throttling.
       LOCK_KEYS_PREFIX = 'throttler'.freeze
 
-      # Initialize rate limits
+      # Initializes rate limits when the module is extended.
+      #
+      # @param [Object] other The object extending this module.
       def self.extended(other)
         other.instance_variable_set(:@rate_limits, {})
       end
 
-      # Method to set rate limits on a specific queue
+      # Sets rate limits for a specific queue.
+      #
+      # @param [Symbol, String] queue The name of the queue to rate limit.
+      # @param [Hash] options The rate limit options.
+      # @option options [Integer] :at The maximum number of jobs allowed in the time window.
+      # @option options [Integer] :per The time window in seconds.
+      #
+      # @example
+      #   Resque.rate_limit(:my_queue, at: 5, per: 60)
+      #
+      # @raise [ArgumentError] If either :at or :per option is missing.
       def rate_limit(queue, options = {})
-        if options.keys.sort != [:at, :per]
+        unless options.keys.sort == [:at, :per]
           raise ArgumentError.new("Missing either :at or :per in options")
         end
 
         @rate_limits[queue.to_s] = options
       end
 
-      # Get rate limit configuration for a queue
+      # Retrieves the rate limit configuration for a queue.
+      #
+      # @param [Symbol, String] queue The name of the queue.
+      # @return [Hash, nil] The rate limit options for the queue, or nil if not set.
       def rate_limit_for(queue)
         @rate_limits[queue.to_s]
       end
 
+      # Returns all queues that have rate limits configured.
+      #
+      # @return [Array<String>] List of queue names as strings.
       def rate_limited_queues
         @rate_limits.keys
       end
 
-      # Check if a queue has a rate limit configured
+      # Checks if a queue has a rate limit configured.
+      #
+      # @param [Symbol, String] queue The name of the queue.
+      # @return [Boolean] True if the queue has a rate limit, false otherwise.
       def queue_rate_limited?(queue)
         !!@rate_limits[queue.to_s]
       end
 
+      # Generates the Redis key for the lock of a specific queue.
+      #
+      # @param [Symbol, String] queue The name of the queue.
+      # @return [String] The Redis key for the queue lock.
       def rate_limiting_queue_lock_key(queue)
         "#{LOCK_KEYS_PREFIX}:lock:#{queue}"
       end
 
+      # Generates the Redis key for the rate limit counter of a specific queue.
+      #
+      # @param [Symbol, String] queue The name of the queue.
+      # @return [String] The Redis key for the rate limit counter.
       def rate_limit_key_for(queue)
         "#{LOCK_KEYS_PREFIX}:rate_limit:#{queue}"
       end
 
+      # Retrieves the number of jobs processed in the current rate limit window for a queue.
+      #
+      # @param [Symbol, String] queue The name of the queue.
+      # @return [Integer] The number of jobs processed.
       def processed_job_count_in_rate_limit_window(queue)
         Resque.redis.get(rate_limit_key_for(queue)).to_i
       end
 
-      # Check if a queue has exceeded its rate limit
+      # Checks if a queue has reached or exceeded its rate limit.
+      #
+      # @param [Symbol, String] queue The name of the queue.
+      # @return [Boolean] True if the queue is at or over its rate limit, false otherwise.
       def queue_at_or_over_rate_limit?(queue)
         if queue_rate_limited?(queue)
           processed_job_count_in_rate_limit_window(queue) >= rate_limit_for(queue)[:at]
@@ -57,6 +95,9 @@ module Resque
         end
       end
 
+      # Resets throttling data for one or all rate-limited queues.
+      #
+      # @param [Symbol, String, nil] queue The name of the queue to reset, or nil to reset all.
       def reset_throttling(queue = nil)
         if queue
           reset_queue_throttling(queue)
@@ -69,6 +110,9 @@ module Resque
 
       private
 
+      # Resets throttling data for a specific queue.
+      #
+      # @param [Symbol, String] queue The name of the queue.
       def reset_queue_throttling(queue)
         lock_key = rate_limiting_queue_lock_key(queue)
         rate_limit_key = rate_limit_key_for(queue)
@@ -85,7 +129,12 @@ Resque.extend(Resque::Plugins::Throttler)
 # Extend Resque::Worker to manage rate-limited queue jobs
 module Resque
   class Worker
-    # Override the `reserve` method to implement rate-limiting logic
+    # Overrides the `reserve` method to implement rate-limiting logic.
+    #
+    # This method attempts to reserve a job from the queues in order,
+    # applying rate limits where configured.
+    #
+    # @return [Resque::Job, nil] The next job to process, or nil if none are available.
     def reserve
       queues.each do |queue|
         log_with_severity :debug, "Checking #{queue}"
@@ -144,17 +193,29 @@ module Resque
 
     private
 
-    # Helper method to acquire a Redis lock
+    # Acquires a Redis lock for the given queue.
+    #
+    # @param [Symbol, String] queue The name of the queue.
+    # @return [Boolean] True if the lock was acquired, false otherwise.
     def acquire_lock(queue)
-      Resque.redis.set(Resque.rate_limiting_queue_lock_key(queue), "locked", ex: 30, nx: true) # NX means "set if not exists"
+      Resque.redis.set(
+        Resque.rate_limiting_queue_lock_key(queue),
+        "locked",
+        ex: 30, # Set expiration to 30 seconds.
+        nx: true # NX option ensures the key is set only if it does not exist.
+      )
     end
 
-    # Helper method to release the Redis lock
+    # Releases the Redis lock for the given queue.
+    #
+    # @param [Symbol, String] queue The name of the queue.
     def release_lock(queue)
       Resque.redis.del(Resque.rate_limiting_queue_lock_key(queue))
     end
 
-    # Helper method to increment the job counter for rate-limiting
+    # Increments the job counter for rate limiting on a queue.
+    #
+    # @param [Symbol, String] queue The name of the queue.
     def increment_job_counter(queue)
       Resque.redis.incr(Resque.rate_limit_key_for(queue))
       limit = Resque.rate_limit_for(queue)
