@@ -1,12 +1,12 @@
 Gem::Specification.new do |s|
   s.name        = "resque-throttler"
-  s.version     = '0.1.5'
+  s.version     = '0.2.0'
   s.licenses    = ['MIT']
   s.authors     = ["Jon Bracy"]
   s.email       = ["jonbracy@gmail.com"]
   s.homepage    = "https://github.com/malomalo/resque-throttler"
-  s.summary     = %q{Rate limit Resque Jobs}
-  s.description = %q{Rate limit how many times a job can be run from a queue}
+  s.summary     = %q{Rate limit and concurrent limit Resque Jobs}
+  s.description = %q{Rate limit how many times a job can be run from a queue and limit concurrent job execution}
 
   s.files         = `git ls-files`.split("\n")
   s.test_files    = `git ls-files -- {test,spec,features}/*`.split("\n")
