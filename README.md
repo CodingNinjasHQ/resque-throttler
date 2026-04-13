@@ -64,7 +64,36 @@ Resque.rate_limit(:api_queue, at: 5, per: 10, concurrent: 2)
 
 # Heavy database operations - limit concurrency to prevent lock issues
 Resque.rate_limit(:db_intensive_queue, at: 10, per: 60, concurrent: 3)
+
+# Override the stale-entry eviction window (default: 3600 seconds / 1 hour).
+# If a worker dies mid-job (SIGKILL, OOM, PruneDeadWorkerDirtyExit) the entry
+# will auto-evict after :max_runtime so the concurrent counter never leaks.
+Resque.rate_limit(:slow_api_queue, at: 5, per: 10, concurrent: 2, max_runtime: 600)
 ```
+
+### Leak-proof concurrent tracking (since v3.1.0)
+
+Active jobs are tracked as entries in a Redis Sorted Set (`throttler:active_jobs_set:<queue>`)
+keyed by a unique per-job token, with the job's start time as the score. Each time
+`active_job_count` is read, entries older than `:max_runtime` are evicted via
+`ZREMRANGEBYSCORE`. This means:
+
+- When a worker is SIGKILL'd (typical on ungraceful shutdown), the per-job token stays
+  in Redis but ages out after `:max_runtime`. No manual `reset_throttling` needed.
+- Earlier versions used a raw `INCR`/`DECR` counter whose decrement relied on a Ruby
+  `ensure` block. `ensure` does not run on SIGKILL, so the counter could leak
+  permanently and eventually block the queue. That class of bug is fixed.
+- Prefer the token-based API directly if you call these methods outside `Worker#perform`:
+  ```ruby
+  token = Resque.register_active_job(:my_queue)
+  begin
+    # ... do work ...
+  ensure
+    Resque.unregister_active_job(:my_queue, token)
+  end
+  ```
+  `increment_active_jobs` and `decrement_active_jobs` still work (they now wrap the
+  token API) but are retained for backward compatibility only.
 
 ### Real-World Examples
 
@@ -221,11 +250,33 @@ Resque.rate_limit(:exclusive_queue, at: 1, per: 0, concurrent: 1)
 
 * [resque-waiting-room](https://github.com/julienXX/resque-waiting-room) - Moves rate-limited jobs to a waiting queue
 
+## Testing
+
+See [`ai_docs/testing.md`](ai_docs/testing.md) for the full testing guide, including:
+
+- Why the test suite must be run inside the NinjasTool Docker container (host Ruby is not supported)
+- The exact `docker cp` + `bundle install` + `RESQUE_REDIS=redis-tool:6379 bundle exec rake test` sequence
+- What each test covers, and which single test is the regression guard for the v3.1 leak-proof invariant
+- Manual SIGKILL verification steps for release-time smoke testing
+- A release checklist covering version bump, Sentry watch, staging-then-prod rollout
+
+Quick version — from the gem directory:
+
+```bash
+docker cp . ninjastool:/tmp/resque-throttler
+docker-compose exec -T ninjastool bash -lc '
+  cd /tmp/resque-throttler && rm -f Gemfile.lock && bundle install --quiet &&
+  RESQUE_REDIS=redis-tool:6379 bundle exec rake test
+'
+```
+
+Expected tail: `16 tests, 31 assertions, 0 failures, 0 errors, 0 skips`.
+
 ## Contributing
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b my-new-feature`)
-3. Add tests for your changes
+3. Add tests for your changes (see [`ai_docs/testing.md`](ai_docs/testing.md))
 4. Commit your changes (`git commit -am 'Add some feature'`)
 5. Push to the branch (`git push origin my-new-feature`)
 6. Create new Pull Request

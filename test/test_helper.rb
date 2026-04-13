@@ -7,12 +7,13 @@ lib = File.expand_path(File.join(root, 'lib'))
 $LOAD_PATH << lib
 
 require 'resque'
+Resque.redis = ENV['RESQUE_REDIS'] if ENV['RESQUE_REDIS'] && !ENV['RESQUE_REDIS'].empty?
 require 'resque/throttler'
 require "minitest/autorun"
 require 'minitest/unit'
 require 'minitest/reporters'
 require "mocha"
-require "mocha/mini_test"
+require "mocha/minitest"
 require 'active_support/testing/time_helpers'
 
 Minitest::Reporters.use! Minitest::Reporters::SpecReporter.new

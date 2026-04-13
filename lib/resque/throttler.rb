@@ -3,16 +3,24 @@ require 'securerandom'
 
 module Resque
   module Plugins
-    # The Throttler module provides rate-limiting capabilities for Resque queues.
+    # The Throttler module provides rate-limiting and concurrent-job limiting for Resque queues.
+    #
+    # Active jobs are tracked as entries in a Redis Sorted Set keyed by a unique per-job token,
+    # with the job's start time as the score. On every count read, entries older than
+    # :max_runtime age out via ZREMRANGEBYSCORE, so counter leaks from SIGKILL'd workers
+    # (e.g. PruneDeadWorkerDirtyExit) self-heal without manual intervention.
     module Throttler
       extend self
 
       # Prefix used for Redis keys related to throttling.
       LOCK_KEYS_PREFIX = 'throttler'.freeze
 
+      # Default upper bound on how long a single job can legitimately run before
+      # its active-job entry is considered stale and evicted. One hour covers typical
+      # long-running jobs; override per-queue via the :max_runtime option.
+      DEFAULT_MAX_RUNTIME = 3600
+
       # Initializes rate limits when the module is extended.
-      #
-      # @param [Object] other The object extending this module.
       def self.extended(other)
         other.instance_variable_set(:@rate_limits, {})
       end
@@ -23,20 +31,23 @@ module Resque
       # @param [Hash] options The rate limit options.
       # @option options [Integer] :at The maximum number of jobs allowed in the time window.
       # @option options [Integer] :per The time window in seconds.
-      # @option options [Integer] :concurrent The maximum number of jobs that can run concurrently (optional).
+      # @option options [Integer] :concurrent Max concurrent jobs running for this queue (optional).
+      # @option options [Integer] :max_runtime Seconds after which a stale active-job entry is
+      #   auto-evicted (defaults to DEFAULT_MAX_RUNTIME). Only meaningful with :concurrent.
       #
       # @example
       #   Resque.rate_limit(:my_queue, at: 5, per: 60)
       #   Resque.rate_limit(:my_queue, at: 5, per: 60, concurrent: 10)
+      #   Resque.rate_limit(:my_queue, at: 5, per: 60, concurrent: 10, max_runtime: 300)
       #
-      # @raise [ArgumentError] If required options are missing.
+      # @raise [ArgumentError] If required options are missing or unknown options are supplied.
       def rate_limit(queue, options = {})
         required_keys = [:at, :per]
         unless (required_keys - options.keys).empty?
           raise ArgumentError.new("Missing either :at or :per in options")
         end
-        
-        allowed_keys = [:at, :per, :concurrent]
+
+        allowed_keys = [:at, :per, :concurrent, :max_runtime]
         invalid_keys = options.keys - allowed_keys
         unless invalid_keys.empty?
           raise ArgumentError.new("Invalid options: #{invalid_keys.join(', ')}")
@@ -45,74 +56,60 @@ module Resque
         @rate_limits[queue.to_s] = options
       end
 
-      # Retrieves the rate limit configuration for a queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Hash, nil] The rate limit options for the queue, or nil if not set.
       def rate_limit_for(queue)
         @rate_limits[queue.to_s]
       end
 
-      # Returns all queues that have rate limits configured.
-      #
-      # @return [Array<String>] List of queue names as strings.
       def rate_limited_queues
         @rate_limits.keys
       end
 
-      # Checks if a queue has a rate limit configured.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Boolean] True if the queue has a rate limit, false otherwise.
       def queue_rate_limited?(queue)
         !!@rate_limits[queue.to_s]
       end
 
-      # Generates the Redis key for the lock of a specific queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [String] The Redis key for the queue lock.
       def rate_limiting_queue_lock_key(queue)
         "#{LOCK_KEYS_PREFIX}:lock:#{queue}"
       end
 
-      # Generates the Redis key for the rate limit counter of a specific queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [String] The Redis key for the rate limit counter.
       def rate_limit_key_for(queue)
         "#{LOCK_KEYS_PREFIX}:rate_limit:#{queue}"
       end
 
-      # Generates the Redis key for tracking active jobs of a specific queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [String] The Redis key for the active jobs counter.
+      # Redis key for the Sorted Set tracking active jobs for a queue.
+      # Members are per-job tokens; scores are job-start Unix timestamps.
+      def active_jobs_set_key_for(queue)
+        "#{LOCK_KEYS_PREFIX}:active_jobs_set:#{queue}"
+      end
+
+      # Legacy counter key retained only for cleanup in reset_throttling so deployments
+      # that had an old leaked counter can DEL it on first reset.
       def active_jobs_key_for(queue)
         "#{LOCK_KEYS_PREFIX}:active_jobs:#{queue}"
       end
 
-      # Retrieves the number of actively running jobs for a queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Integer] The number of active jobs.
-      def active_job_count(queue)
-        Resque.redis.get(active_jobs_key_for(queue)).to_i
+      # Returns the configured max job runtime (in seconds) for the queue, or the default.
+      def max_runtime_for(queue)
+        rate_limit = rate_limit_for(queue)
+        (rate_limit && rate_limit[:max_runtime]) || DEFAULT_MAX_RUNTIME
       end
 
-      # Checks if a queue has a concurrent limit configured.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Boolean] True if the queue has a concurrent limit, false otherwise.
+      # Returns the current active-job count for a queue, first evicting stale entries
+      # older than :max_runtime. This is what makes the tracking self-healing: a job whose
+      # worker was SIGKILL'd (and therefore never ran its ensure-block unregister) is
+      # dropped here the next time anyone asks for the count.
+      def active_job_count(queue)
+        key = active_jobs_set_key_for(queue)
+        cutoff = Time.now.to_f - max_runtime_for(queue)
+        Resque.redis.zremrangebyscore(key, '-inf', cutoff)
+        Resque.redis.zcard(key)
+      end
+
       def queue_has_concurrent_limit?(queue)
         rate_limit = rate_limit_for(queue)
         rate_limit && rate_limit[:concurrent]
       end
 
-      # Checks if a queue has reached or exceeded its concurrent job limit.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Boolean] True if the queue is at or over its concurrent limit, false otherwise.
       def queue_at_or_over_concurrent_limit?(queue)
         if queue_has_concurrent_limit?(queue)
           active_job_count(queue) >= rate_limit_for(queue)[:concurrent]
@@ -121,42 +118,44 @@ module Resque
         end
       end
 
-      # Increments the active job counter for a queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Integer] The new count of active jobs.
+      # Registers a new active job and returns a token that must be passed to
+      # unregister_active_job when the job finishes. The score is the job-start
+      # timestamp, which is what allows stale entries to be auto-evicted later.
+      def register_active_job(queue)
+        token = SecureRandom.uuid
+        Resque.redis.zadd(active_jobs_set_key_for(queue), Time.now.to_f, token)
+        token
+      end
+
+      # Removes a previously-registered active job. Safe to call with a nil token
+      # (no-op) so the ensure-block path stays simple.
+      def unregister_active_job(queue, token)
+        return if token.nil?
+        Resque.redis.zrem(active_jobs_set_key_for(queue), token)
+      end
+
+      # @deprecated Use {#register_active_job} and capture the returned token.
+      # Retained for backward compatibility; the returned token is a string rather
+      # than an integer count, so callers relying on the old numeric return value
+      # should migrate to the token API.
       def increment_active_jobs(queue)
-        Resque.redis.incr(active_jobs_key_for(queue))
+        register_active_job(queue)
       end
 
-      # Decrements the active job counter for a queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Integer] The new count of active jobs.
+      # @deprecated Use {#unregister_active_job} with the token from {#register_active_job}.
+      # Without a token there is no way to know which entry to remove, so this falls back
+      # to removing the oldest entry (ZPOPMIN). Paired increment/decrement calls without
+      # intervening SIGKILL still behave correctly under this fallback.
       def decrement_active_jobs(queue)
-        key = active_jobs_key_for(queue)
-        count = Resque.redis.decr(key)
-        # Ensure counter doesn't go negative
-        if count < 0
-          Resque.redis.set(key, 0)
-          0
-        else
-          count
-        end
+        key = active_jobs_set_key_for(queue)
+        Resque.redis.zpopmin(key, 1)
+        active_job_count(queue)
       end
 
-      # Retrieves the number of jobs processed in the current rate limit window for a queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Integer] The number of jobs processed.
       def processed_job_count_in_rate_limit_window(queue)
         Resque.redis.get(rate_limit_key_for(queue)).to_i
       end
 
-      # Checks if a queue has reached or exceeded its rate limit.
-      #
-      # @param [Symbol, String] queue The name of the queue.
-      # @return [Boolean] True if the queue is at or over its rate limit, false otherwise.
       def queue_at_or_over_rate_limit?(queue)
         if queue_rate_limited?(queue)
           processed_job_count_in_rate_limit_window(queue) >= rate_limit_for(queue)[:at]
@@ -166,8 +165,6 @@ module Resque
       end
 
       # Resets throttling data for one or all rate-limited queues.
-      #
-      # @param [Symbol, String, nil] queue The name of the queue to reset, or nil to reset all.
       def reset_throttling(queue = nil)
         if queue
           reset_queue_throttling(queue)
@@ -180,71 +177,52 @@ module Resque
 
       private
 
-      # Resets throttling data for a specific queue.
-      #
-      # @param [Symbol, String] queue The name of the queue.
       def reset_queue_throttling(queue)
-        lock_key = rate_limiting_queue_lock_key(queue)
-        rate_limit_key = rate_limit_key_for(queue)
-        active_jobs_key = active_jobs_key_for(queue)
-        Resque.redis.del(lock_key)
-        Resque.redis.del(rate_limit_key)
-        Resque.redis.del(active_jobs_key)
+        Resque.redis.del(rate_limiting_queue_lock_key(queue))
+        Resque.redis.del(rate_limit_key_for(queue))
+        Resque.redis.del(active_jobs_set_key_for(queue))
+        # Also clean up the legacy counter key from pre-sorted-set versions.
+        Resque.redis.del(active_jobs_key_for(queue))
       end
     end
   end
 end
 
-# Extend Resque with Throttler functionality
 Resque.extend(Resque::Plugins::Throttler)
 
-# Extend Resque::Worker to manage rate-limited queue jobs
 module Resque
   class Worker
-    # Overrides the `perform` method to track active jobs for concurrent limiting.
-    #
-    # @param [Resque::Job] job The job to perform.
     alias_method :original_perform, :perform
+
+    # Overrides Worker#perform to register the job in the active-set before running
+    # and unregister it after. The token is captured in a local variable and used
+    # in the ensure block — if the process is SIGKILL'd, the ensure block does not
+    # run but the entry still ages out via max_runtime.
     def perform(job)
       queue = job.queue
-      
-      # Only track active jobs if the queue has rate limiting configured
+
       if Resque.queue_rate_limited?(queue)
+        token = Resque.register_active_job(queue)
+        log_with_severity :debug, "Registered active job token=#{token} for #{queue} (count=#{Resque.active_job_count(queue)})"
         begin
-          # Increment active job counter
-          Resque.increment_active_jobs(queue)
-          log_with_severity :debug, "Incremented active jobs for #{queue} to #{Resque.active_job_count(queue)}"
-          
-          # Perform the job
           original_perform(job)
         ensure
-          # Always decrement counter, even if job fails
-          Resque.decrement_active_jobs(queue)
-          log_with_severity :debug, "Decremented active jobs for #{queue} to #{Resque.active_job_count(queue)}"
+          Resque.unregister_active_job(queue, token)
+          log_with_severity :debug, "Unregistered active job token=#{token} for #{queue} (count=#{Resque.active_job_count(queue)})"
         end
       else
-        # No tracking needed for non-rate-limited queues
         original_perform(job)
       end
     end
 
-    # Overrides the `reserve` method to implement rate-limiting logic.
-    #
-    # This method attempts to reserve a job from the queues in order,
-    # applying rate limits where configured.
-    #
-    # @return [Resque::Job, nil] The next job to process, or nil if none are available.
     def reserve
       queues.each do |queue|
         log_with_severity :debug, "Checking #{queue}"
 
-        # Step 1: Check if rate limits apply to this queue.
         if Resque.queue_rate_limited?(queue)
           log_with_severity :debug, "Rate limit applies to #{queue}, attempting to acquire lock"
 
-          # Step 2: Try to acquire a Redis lock for this queue.
           lock_acquired = acquire_lock(queue)
-
           unless lock_acquired
             log_with_severity :debug, "Could not acquire lock for #{queue}, skipping"
             next
@@ -252,38 +230,28 @@ module Resque
 
           log_with_severity :debug, "lock acquired"
 
-          # Step 3: Check if rate limit is exceeded for this queue.
           if Resque.queue_at_or_over_rate_limit?(queue)
             log_with_severity :debug, "#{queue} is over its rate limit, releasing lock and skipping"
             release_lock(queue)
-            log_with_severity :debug, "lock released"
             next
           end
-          log_with_severity :debug, "#{queue} is not over its rate limit, proceeding"
 
-          # Step 3.5: Check if concurrent limit is exceeded for this queue.
           if Resque.queue_at_or_over_concurrent_limit?(queue)
             log_with_severity :debug, "#{queue} is at concurrent job limit (#{Resque.active_job_count(queue)} active jobs), releasing lock and skipping"
             release_lock(queue)
-            log_with_severity :debug, "lock released"
             next
           end
 
-          # Step 4: Reserve a job from the queue.
           if job = Resque.reserve(queue)
             log_with_severity :debug, "Found job on #{queue}"
             increment_job_counter(queue)
-
             release_lock(queue)
-            log_with_severity :debug, "lock released"
             return job
           else
             log_with_severity :debug, "No job on #{queue}"
             release_lock(queue)
-            log_with_severity :debug, "lock released, continuing checking other queues"
           end
         else
-          log_with_severity :debug, "Checking #{queue}"
           if job = Resque.reserve(queue)
             log_with_severity :debug, "Found job on #{queue}"
             return job
@@ -300,29 +268,19 @@ module Resque
 
     private
 
-    # Acquires a Redis lock for the given queue.
-    #
-    # @param [Symbol, String] queue The name of the queue.
-    # @return [Boolean] True if the lock was acquired, false otherwise.
     def acquire_lock(queue)
       Resque.redis.set(
         Resque.rate_limiting_queue_lock_key(queue),
         "locked",
-        ex: 30, # Set expiration to 30 seconds.
-        nx: true # NX option ensures the key is set only if it does not exist.
+        ex: 30,
+        nx: true
       )
     end
 
-    # Releases the Redis lock for the given queue.
-    #
-    # @param [Symbol, String] queue The name of the queue.
     def release_lock(queue)
       Resque.redis.del(Resque.rate_limiting_queue_lock_key(queue))
     end
 
-    # Increments the job counter for rate limiting on a queue.
-    #
-    # @param [Symbol, String] queue The name of the queue.
     def increment_job_counter(queue)
       Resque.redis.incr(Resque.rate_limit_key_for(queue))
       limit = Resque.rate_limit_for(queue)
