@@ -33,10 +33,16 @@ This happened in NinjasTool's `lsq_rl_pro` queue in April 2026 — five dirty ex
 | `throttler:active_jobs_set:<queue>` | Sorted Set | Active-job tokens. Members are random UUIDs; scores are job-start Unix timestamps. Size = concurrent count after stale eviction. |
 | `throttler:active_jobs:<queue>` | String (legacy v3.0) | Old raw counter. Retained only so `reset_throttling` can `DEL` it during migration. Do not write. |
 
+`<queue>` in every key above is `bucket_queue_for(queue)` (since v3.2.0): for a queue
+registered with `bucket:`, the keys are the BUCKET queue's keys, which is how all
+queues in a bucket share one budget. Direct queues resolve to themselves.
+
 ### Public API surface
 
 - `Resque.rate_limit(queue, at:, per:, concurrent: nil, max_runtime: 3600)` — configure
-- `Resque.rate_limit_for(queue)` → Hash
+- `Resque.rate_limit(queue, bucket: other_queue)` — share `other_queue`'s throttling bucket — **since v3.2**
+- `Resque.rate_limit_for(queue)` → Hash — for bucketed queues, the BUCKET queue's config (resolved at read time)
+- `Resque.bucket_queue_for(queue)` → the queue whose bucket `queue` draws from (itself when not bucketed) — **since v3.2**
 - `Resque.queue_rate_limited?(queue)` → Boolean
 - `Resque.queue_at_or_over_rate_limit?(queue)` → Boolean (window-based)
 - `Resque.queue_at_or_over_concurrent_limit?(queue)` → Boolean (sorted-set-based)
@@ -51,6 +57,7 @@ This happened in NinjasTool's `lsq_rl_pro` queue in April 2026 — five dirty ex
 - `:at` and `:per` are required together.
 - `:concurrent` is optional; without it, only rate limiting applies.
 - `:max_runtime` only matters when `:concurrent` is set. Defaults to `DEFAULT_MAX_RUNTIME = 3600` (1 hour). Tune it to be greater than the worst-case legitimate job runtime for the queue. Too short = risk of over-admission (evicting a token while its job is still running). Too long = slow self-healing after a SIGKILL.
+- `:bucket` must be passed **alone**. The bucket queue must already be registered with its own `at:`/`per:` (register order matters); chains and self-references raise `ArgumentError`. A bucketed queue stores no config of its own — everything is inherited from the bucket at read time, so the two can never drift.
 
 ## Commands
 
@@ -70,12 +77,12 @@ docker-compose exec -T ninjastool bash -lc '
   cd /tmp/resque-throttler && rm -f Gemfile.lock && bundle install --quiet &&
   RESQUE_REDIS=redis-tool:6379 bundle exec rake test
 '
-# Expect: "16 tests, 31 assertions, 0 failures, 0 errors, 0 skips"
+# Expect: "27 tests, 59 assertions, 0 failures, 0 errors, 0 skips"
 ```
 
 ### Test inventory
 
-`test/resque_test.rb` has 16 tests. The one to watch is:
+`test/resque_test.rb` has 27 tests. The one to watch is:
 
 > `test_stale_entries_older_than_:max_runtime_are_auto-evicted_on_count`
 

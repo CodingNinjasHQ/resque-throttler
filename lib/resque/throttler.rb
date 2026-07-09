@@ -9,6 +9,14 @@ module Resque
     # with the job's start time as the score. On every count read, entries older than
     # :max_runtime age out via ZREMRANGEBYSCORE, so counter leaks from SIGKILL'd workers
     # (e.g. PruneDeadWorkerDirtyExit) self-heal without manual intervention.
+    #
+    # A queue can also be registered with `bucket: :other_queue` to SHARE that queue's
+    # throttling bucket instead of getting its own: every throttling Redis key (window
+    # counter, reserve lock, active-job set) resolves to the bucket queue's key and the
+    # rate-limit configuration is inherited from it, so the COMBINED throughput of all
+    # queues in a bucket stays within the one limit. Use this for strict-priority lanes —
+    # a queue listed before its default queue in a worker's QUEUES list that must not
+    # add to the shared downstream budget (e.g. a third-party API allowance).
     module Throttler
       extend self
 
@@ -25,7 +33,8 @@ module Resque
         other.instance_variable_set(:@rate_limits, {})
       end
 
-      # Sets rate limits for a specific queue.
+      # Sets rate limits for a specific queue, or registers the queue onto another
+      # rate-limited queue's shared throttling bucket.
       #
       # @param [Symbol, String] queue The name of the queue to rate limit.
       # @param [Hash] options The rate limit options.
@@ -34,14 +43,25 @@ module Resque
       # @option options [Integer] :concurrent Max concurrent jobs running for this queue (optional).
       # @option options [Integer] :max_runtime Seconds after which a stale active-job entry is
       #   auto-evicted (defaults to DEFAULT_MAX_RUNTIME). Only meaningful with :concurrent.
+      # @option options [Symbol, String] :bucket Share the named queue's throttling bucket
+      #   instead of configuring an own limit. Must be passed ALONE, and the bucket queue
+      #   must already be rate-limited with its own at:/per: options. All throttling Redis
+      #   keys resolve to the bucket queue's keys and the configuration (:at, :per,
+      #   :concurrent, :max_runtime) is inherited from it, so the combined throughput of
+      #   all queues sharing a bucket stays within the bucket queue's limit.
       #
       # @example
       #   Resque.rate_limit(:my_queue, at: 5, per: 60)
       #   Resque.rate_limit(:my_queue, at: 5, per: 60, concurrent: 10)
       #   Resque.rate_limit(:my_queue, at: 5, per: 60, concurrent: 10, max_runtime: 300)
+      #   Resque.rate_limit(:my_queue_priority, bucket: :my_queue)
       #
-      # @raise [ArgumentError] If required options are missing or unknown options are supplied.
+      # @raise [ArgumentError] If required options are missing, unknown options are supplied,
+      #   or a :bucket registration is invalid (combined with other options, target not
+      #   rate-limited, target itself bucketed, or self-referential).
       def rate_limit(queue, options = {})
+        return register_shared_bucket(queue, options) if options.key?(:bucket)
+
         required_keys = [:at, :per]
         unless (required_keys - options.keys).empty?
           raise ArgumentError.new("Missing either :at or :per in options")
@@ -56,8 +76,23 @@ module Resque
         @rate_limits[queue.to_s] = options
       end
 
+      # The effective rate-limit configuration for a queue. For a queue registered
+      # with bucket:, this is the BUCKET queue's configuration (resolved at read
+      # time, so later re-registration of the bucket queue is picked up).
       def rate_limit_for(queue)
-        @rate_limits[queue.to_s]
+        config = @rate_limits[queue.to_s]
+        return config unless config && config.key?(:bucket)
+
+        @rate_limits[config[:bucket]]
+      end
+
+      # The queue whose throttling bucket `queue` draws from: the bucket target
+      # for queues registered with bucket:, otherwise the queue itself. All
+      # throttling Redis keys are derived from this name, which is what makes
+      # every queue in a bucket check and consume ONE shared budget.
+      def bucket_queue_for(queue)
+        config = @rate_limits[queue.to_s]
+        (config && config[:bucket]) || queue
       end
 
       def rate_limited_queues
@@ -68,24 +103,27 @@ module Resque
         !!@rate_limits[queue.to_s]
       end
 
+      # All four key builders below derive the key from bucket_queue_for(queue),
+      # so queues registered with bucket: transparently share the bucket queue's
+      # lock, window counter and active-job set.
       def rate_limiting_queue_lock_key(queue)
-        "#{LOCK_KEYS_PREFIX}:lock:#{queue}"
+        "#{LOCK_KEYS_PREFIX}:lock:#{bucket_queue_for(queue)}"
       end
 
       def rate_limit_key_for(queue)
-        "#{LOCK_KEYS_PREFIX}:rate_limit:#{queue}"
+        "#{LOCK_KEYS_PREFIX}:rate_limit:#{bucket_queue_for(queue)}"
       end
 
       # Redis key for the Sorted Set tracking active jobs for a queue.
       # Members are per-job tokens; scores are job-start Unix timestamps.
       def active_jobs_set_key_for(queue)
-        "#{LOCK_KEYS_PREFIX}:active_jobs_set:#{queue}"
+        "#{LOCK_KEYS_PREFIX}:active_jobs_set:#{bucket_queue_for(queue)}"
       end
 
       # Legacy counter key retained only for cleanup in reset_throttling so deployments
       # that had an old leaked counter can DEL it on first reset.
       def active_jobs_key_for(queue)
-        "#{LOCK_KEYS_PREFIX}:active_jobs:#{queue}"
+        "#{LOCK_KEYS_PREFIX}:active_jobs:#{bucket_queue_for(queue)}"
       end
 
       # Returns the configured max job runtime (in seconds) for the queue, or the default.
@@ -176,6 +214,33 @@ module Resque
       end
 
       private
+
+      # Registers `queue` onto another rate-limited queue's throttling bucket.
+      # Strictness here is deliberate: the bucket target must already carry the
+      # real at:/per: configuration (which the bucketed queue then inherits via
+      # rate_limit_for), and chains/self-references are rejected because a
+      # bucket entry holds no configuration of its own to inherit.
+      def register_shared_bucket(queue, options)
+        invalid_keys = options.keys - [:bucket]
+        unless invalid_keys.empty?
+          raise ArgumentError.new("bucket: cannot be combined with other options (got: #{invalid_keys.join(', ')})")
+        end
+
+        bucket = options[:bucket].to_s
+        if bucket == queue.to_s
+          raise ArgumentError.new("queue #{queue} cannot use itself as a bucket")
+        end
+
+        target = @rate_limits[bucket]
+        if target.nil?
+          raise ArgumentError.new("bucket queue #{bucket} is not rate-limited (register it before #{queue})")
+        end
+        if target.key?(:bucket)
+          raise ArgumentError.new("bucket queue #{bucket} itself shares a bucket; chains are not allowed")
+        end
+
+        @rate_limits[queue.to_s] = { bucket: bucket }
+      end
 
       def reset_queue_throttling(queue)
         Resque.redis.del(rate_limiting_queue_lock_key(queue))

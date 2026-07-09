@@ -11,6 +11,7 @@ This document describes how to run and extend the test suite for `resque-throttl
 5. **Leak-proof invariant**: an active-job entry that is never unregistered (i.e. the worker was SIGKILL'd before its `ensure` block could run) is evicted by the next `active_job_count` call after `:max_runtime` seconds have elapsed. The queue auto-unblocks.
 6. `reset_throttling(queue)` clears both the v3.1+ sorted set and the legacy v3.0 counter key.
 7. Backward-compat shims `increment_active_jobs` / `decrement_active_jobs` still behave reasonably (they now wrap the token API).
+8. **Shared buckets (v3.2+)**: a queue registered with `bucket:` inherits the bucket queue's config, resolves all throttling keys to the bucket's keys, trips the shared window/concurrency limits from either queue name, self-heals leaked tokens on the shared set, and rejects invalid registrations (combined options, unregistered target, chains, self-reference). A `Worker#reserve` test proves a priority lane drains first while the pair stops at the single shared `:at` budget.
 
 ## Environment — run tests inside the NinjasTool Docker container, not on the host
 
@@ -57,7 +58,7 @@ docker-compose exec -T ninjastool bash -lc '
 Expected output tail:
 
 ```
-16 tests, 31 assertions, 0 failures, 0 errors, 0 skips
+27 tests, 59 assertions, 0 failures, 0 errors, 0 skips
 ```
 
 ### Re-running without re-copying
@@ -98,6 +99,17 @@ File: `test/resque_test.rb`. Test names are read verbatim by Minitest — keep t
 | `increment_active_jobs still bumps the count (returns a token)` | Deprecated shim still works | Backward compat |
 | `decrement_active_jobs removes the oldest entry when no token given` | FIFO fallback for tokenless callers | Backward compat |
 | `decrement_active_jobs does not go negative on empty set` | ZPOPMIN on empty set is safe | Edge-case hardening |
+| `rate_limit with bucket: inherits the bucket queue's config` | `rate_limit_for`/`bucket_queue_for` resolution | Shared-bucket config contract (v3.2) |
+| `rate_limit with bucket: resolves config changes at read time` | Bucket re-registration is picked up | No stale copies of the config |
+| `rate_limit rejects bucket: combined with other options` | `bucket:` is exclusive | Prevents ambiguous half-shared configs |
+| `rate_limit rejects bucket: pointing at an unregistered queue` | Register order enforced | Fail fast at boot, not in reserve |
+| `rate_limit rejects self-referential and chained buckets` | No cycles / chains | A bucket entry has no config to inherit |
+| `bucketed queue's throttling keys resolve to the bucket queue's keys` | All four key builders alias; unrelated queues untouched | The mechanism of budget sharing |
+| `shared window counter trips the limit for every queue in the bucket` | One counter gates both names | Combined rate can never exceed the bucket's `:at` |
+| `active jobs from any queue in the bucket count against one concurrency cap` | One sorted set gates both names | Combined concurrency stays at the bucket's `:concurrent` |
+| `stale entries registered via a bucketed queue self-heal after :max_runtime` | SIGKILL simulation through the lane | Leak-proof invariant holds for buckets too |
+| `reset_throttling via either queue name clears the shared bucket keys` | Admin reset symmetric across names | Operational parity |
+| `worker drains a priority lane first and both queues share one rate budget` | Real `Worker#reserve` over both queues | End-to-end: priority order + single budget |
 
 ### The leak-proof test is the one that matters
 

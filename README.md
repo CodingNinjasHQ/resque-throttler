@@ -95,6 +95,32 @@ keyed by a unique per-job token, with the job's start time as the score. Each ti
   `increment_active_jobs` and `decrement_active_jobs` still work (they now wrap the
   token API) but are retained for backward compatibility only.
 
+### Shared buckets — priority lanes without extra budget (since v3.2.0)
+
+Register a queue with `bucket:` to make it share another rate-limited queue's
+throttling budget instead of getting its own:
+
+```ruby
+Resque.rate_limit(:my_queue, at: 5, per: 5, concurrent: 5)
+Resque.rate_limit(:my_queue_priority, bucket: :my_queue)
+```
+
+Every throttling Redis key (window counter, reserve lock, active-job set) of
+`my_queue_priority` resolves to `my_queue`'s key, and its configuration is
+inherited from `my_queue` at read time — so the two queues can never drift and
+their COMBINED throughput stays within the single 5-jobs/5s budget.
+
+The intended use is a strict-priority lane: list the priority queue before the
+default one in the worker's queue list (`QUEUE=my_queue_priority,my_queue,...`).
+Workers scan queues in order, so priority jobs are always reserved first, while
+the shared bucket guarantees the pair never exceeds what the single queue was
+allowed to send before — important when the limit models an external API
+allowance.
+
+`bucket:` must be passed alone; the bucket queue must already be registered
+with its own `at:`/`per:` options; chains (`bucket:` pointing at another
+bucketed queue) and self-references raise `ArgumentError`.
+
 ### Real-World Examples
 
 #### 1. External API Integration
